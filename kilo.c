@@ -80,8 +80,8 @@ int main() {
 		char c = '\0';
 
 		// Using Cygwin, EAGAIN is not treated as an error...
-		// if (read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
-		if (read(STDIN_FILENO, &c, 1) == -1)
+		if (read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
+		// if (read(STDIN_FILENO, &c, 1) == -1)
 			die("read");
 
 		// If c is control character...
