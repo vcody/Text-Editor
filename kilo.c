@@ -4,13 +4,19 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 #include <sys/ioctl.h>
 
 /*** DEFINES ***/
+// Handles ctrl+(key) presses
 #define CTRL_KEY(k) ((k) & 0x1f)
+// Initialize empty buffer
+#define APP_BUFFER_INIT {NULL, 0}
 
 /*** DATA ***/
 struct editorConfig {
+	// holds screen dimensions
+	// orig_termios: original terminal settings
 	int screenrows;
 	int screencols;
 
@@ -66,7 +72,9 @@ void enableRawMode() {
 	// Sets the character size to 8 bits per byte (already default)
 	raw.c_cflag |= (CS8);
 
+	// Sets min. number of bytes of input needed before read() returns
 	raw.c_cc[VMIN] = 0;
+	// Sets max. amount of time to wait before read() returns (in 1/10 seconds)
 	raw.c_cc[VTIME] = 1;
 
 	// TCSAFLUSH argument specifies when to apply change
@@ -96,6 +104,7 @@ int getCursorPosition(int *rows, int *cols) {
 	if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
 		return -1;
 	
+	// Read chars into buffer until it reads 'R'
 	while (i < sizeof(buffer) - 1) {
 		if (read(STDIN_FILENO, &buffer[i], 1) != 1)
 			break;
@@ -105,10 +114,14 @@ int getCursorPosition(int *rows, int *cols) {
 	}
 	buffer[i] = '\0';
 	
-	printf("\r\n&buffer[1]: '%s'\r\n", &buffer[1]);
+	// Make sure first char is escape sequence
+	if (buffer[0] != '\x1b' || buffer[1] != '[')
+		return -1;
 
-	editorReadKey();
-	return -1;
+	if (sscanf(&buffer[2], "%d;%d", rows, cols) != 2)
+		return -1;
+	
+	return 0;
 }
 
 int getWindowSize(int *rows, int *cols) {
@@ -119,7 +132,6 @@ int getWindowSize(int *rows, int *cols) {
 		if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
 			return -1;
 		return getCursorPosition(rows, cols);
-		return -1;
 	} else {
 		*cols = ws.ws_col;
 		*rows = ws.ws_row;
@@ -127,22 +139,59 @@ int getWindowSize(int *rows, int *cols) {
 	}
 }
 
+/*** APPEND BUFFER ***/
+struct app_buffer {
+	// *b: pointer to buffer in memory
+	// len: length
+	char *b;
+	int len;
+};
+
+// Appends string to buffer 
+void abAppend(struct app_buffer *ab, const char *s, int len) {
+	// Allocate memory, size of current string + appending string	
+	char *new = realloc(ab->b, ab->len + len);
+
+	if (new == NULL) return;
+	
+	// Copy string after end of current data in buffer...
+	// Then, update pointer/length of app_buffer
+	memcpy(&new[ab->len], s, len);
+	ab->b = new;
+	ab->len += len;
+}
+
+// Deallocates memory used by app_buffer
+void abFree(struct app_buffer *ab) {
+	free(ab->b);
+}
+
 /*** OUTPUT ***/
-void editorDrawRows() {
+void editorDrawRows(struct app_buffer *ab) {
 	// Writes length rows ~ characters on start of each row
-	for (int i = 0; i < E.screenrows; i++) 
-		write(STDOUT_FILENO, "~\r\n", 3);
+	for (int i= 0; i < E.screenrows; i++) { 
+		write(ab, "~", 1);
+		
+		// If it isn't the last row...
+		if (i < E.screenrows - 1)
+			write(ab, "\r\n", 2);
+	}
 }
 
 void editorRefreshScreen() {
-	// Uses escape sequences to clear screen, reset cursor
-	write(STDOUT_FILENO, "\x1b[2J", 4);
-	write(STDOUT_FILENO, "\x1b[H", 3);
+	struct app_buffer ab = APP_BUFFER_INIT;
 
-	editorDrawRows();
+	// Uses escape sequences to clear screen, reset cursor
+	abAppend(&ab, "\x1b[2J", 4);
+	abAppend(&ab, "\x1b[H", 3);
+
+	editorDrawRows(&ab);
 
 	// Reposition cursor after drawing
-	write(STDOUT_FILENO, "\x1b[H", 3);
+	abAppend(&ab, "\x1b[H", 3);
+
+	write(STDOUT_FILENO, ab.b, ab.len);
+	abFree(&ab);
 }
 
 /*** INPUT ***/
