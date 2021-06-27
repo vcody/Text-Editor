@@ -12,9 +12,13 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 // Initialize empty buffer
 #define APP_BUFFER_INIT {NULL, 0}
+// Text editor version number
+#define VERSION "0.0.1"
 
 /*** DATA ***/
 struct editorConfig {
+	// Cursor position (x, y)
+	int cx, cy;
 	// holds screen dimensions
 	// orig_termios: original terminal settings
 	int screenrows;
@@ -170,31 +174,73 @@ void abFree(struct app_buffer *ab) {
 void editorDrawRows(struct app_buffer *ab) {
 	// Writes length rows ~ characters on start of each row
 	for (int i= 0; i < E.screenrows; i++) { 
-		write(ab, "~", 1);
+		// Display welcome message
+		if (i == E.screenrows / 3) {
+			char welcome[80];
+			int welcomelen = snprintf(welcome, sizeof(welcome),
+				"CV Editor -- ver. %s", VERSION);
+			if (welcomelen > E.screencols) welcomelen = E.screencols;
+
+			// Centers message
+			int padding = (E.screencols - welcomelen) / 2;
+			if (padding) {
+				abAppend(ab, "~", 1);
+				padding--;
+			}
+			while (padding--) abAppend(ab, " ", 1);
+			abAppend(ab, welcome, welcomelen);
+		}
+		else abAppend(ab, "~", 1);
 		
+		// Escape sequence to clear lines 
+		abAppend(ab, "\x1b[K", 3);
+
 		// If it isn't the last row...
 		if (i < E.screenrows - 1)
-			write(ab, "\r\n", 2);
+			abAppend(ab, "\r\n", 2);
 	}
 }
 
 void editorRefreshScreen() {
 	struct app_buffer ab = APP_BUFFER_INIT;
 
-	// Uses escape sequences to clear screen, reset cursor
-	abAppend(&ab, "\x1b[2J", 4);
+	// Uses escape sequences to hide cursor, reset cursor
+	abAppend(&ab, "\x1b[?25l", 6); 
 	abAppend(&ab, "\x1b[H", 3);
 
 	editorDrawRows(&ab);
 
-	// Reposition cursor after drawing
-	abAppend(&ab, "\x1b[H", 3);
+	// Moves cursor on screen
+	char buffer[32];
+	snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+	abAppend(&ab, buffer, strlen(buffer)); 
+
+	// Show cursor
+	abAppend(&ab, "\x1b[?25h", 6);
 
 	write(STDOUT_FILENO, ab.b, ab.len);
 	abFree(&ab);
 }
 
 /*** INPUT ***/
+// Adds WASD cursor movement
+void editorMoveCursor(char key) {
+	switch (key) {
+		case 'a':
+			E.cx--;
+			break;
+		case 'd':
+			E.cx++;
+			break;
+		case 'w':
+			E.cy--;
+			break;
+		case 's':
+			E.cy++;
+			break;
+	}
+}
+
 // Takes keypress, then handles it based on switch case 
 void editorProcessKeypress() {
 	char c = editorReadKey();
@@ -205,11 +251,22 @@ void editorProcessKeypress() {
 			write(STDOUT_FILENO, "\x1b[H", 3);
 			exit(0);
 			break;
+
+		case 'w':
+		case 's':
+		case 'a':
+		case 'd':
+			editorMoveCursor(c);
+			break;
 	}
 }
 
 /*** INIT ***/
 void initEditor() {
+	// Cursor position (x,y)
+	E.cx = 0;
+	E.cy = 0;
+
 	if (getWindowSize(&E.screenrows, &E.screencols) == -1) 
 		die("getWindowSize");
 }
