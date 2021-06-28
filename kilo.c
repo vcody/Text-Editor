@@ -1,3 +1,8 @@
+// Feature test macros
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <stdio.h>
 #include <termios.h>
@@ -6,6 +11,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 
 /*** DEFINES ***/
 // Handles ctrl+(key) presses
@@ -30,13 +36,24 @@ enum editorKey {
 };
 
 /*** DATA ***/
+// Stores row of text
+typedef struct erow {
+	int size;
+	char *chars;
+} erow;
+
 struct editorConfig {
 	// Cursor position (x, y)
 	int cx, cy;
-	// holds screen dimensions
+	// Holds screen dimensions
 	// orig_termios: original terminal settings
 	int screenrows;
 	int screencols;
+	// For row text storing
+	int numrows;
+	erow *row;
+	// Row that user is currently on
+	int rowoffset;
 
 	struct termios orig_termios;
 };
@@ -201,6 +218,44 @@ int getWindowSize(int *rows, int *cols) {
 	}
 }
 
+/*** ROW OPERATIONS ***/
+void editorAppendRow(char *s, size_t len) {
+	// Adds row s of size len to text
+	// Allocate size of erow * number of rows
+	E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+	int at = E.numrows;
+	E.row[at].size = len;
+	E.row[at].chars = malloc(len + 1);
+	memcpy(E.row[at].chars, s, len);
+	E.row[at].chars[len] = '\0';
+	E.numrows++;
+}
+
+/*** FILE I/O ***/
+void editorOpen(char *filename) {
+	// Open file
+	FILE *fp = fopen(filename, "r");	
+	if (!fp) die("fopen");
+
+	char *line = NULL;
+	size_t linecap = 0;
+	ssize_t linelen;
+
+	linelen = getline(&line, &linecap, fp);
+	
+	// While there are more lines to be read...
+	while ((linelen = getline(&line, &linecap, fp)) != -1) {
+		while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
+			linelen--;
+		
+		editorAppendRow(line, linelen);
+	}
+	// Close pointer/file
+	free(line);
+	fclose(fp);
+}
+
 /*** APPEND BUFFER ***/
 struct app_buffer {
 	// *b: pointer to buffer in memory
@@ -229,11 +284,23 @@ void abFree(struct app_buffer *ab) {
 }
 
 /*** OUTPUT ***/
+void editorScroll() {
+	// If user scrolls up...
+	if (E.cy < E.rowoffset) 
+		E.rowoffset = E.cy;
+	// If user scrolls down...
+	if (E.cy >= E.rowoffset + E.screenrows)
+		E.rowoffset = E.cy - E.screenrows + 1;
+}
+
 void editorDrawRows(struct app_buffer *ab) {
 	// Writes length rows ~ characters on start of each row
 	for (int i= 0; i < E.screenrows; i++) { 
-		// Display welcome message
-		if (i == E.screenrows / 3) {
+		int filerow = i + E.rowoffset;
+		// If drawing row that isn't part of text buffer...
+		if (filerow >= E.numrows) {
+		// Display welcome message if no file specified
+		if (E.numrows == 0 && i == E.screenrows / 3) {
 			char welcome[80];
 			int welcomelen = snprintf(welcome, sizeof(welcome),
 				"CV Editor -- ver. %s", VERSION);
@@ -249,7 +316,12 @@ void editorDrawRows(struct app_buffer *ab) {
 			abAppend(ab, welcome, welcomelen);
 		}
 		else abAppend(ab, "~", 1);
-		
+		}
+		else {
+			int len = E.row[filerow].size;
+			if (len > E.screencols) len = E.screencols;
+			abAppend(ab, E.row[filerow].chars, len);
+		}
 		// Escape sequence to clear lines 
 		abAppend(ab, "\x1b[K", 3);
 
@@ -260,6 +332,8 @@ void editorDrawRows(struct app_buffer *ab) {
 }
 
 void editorRefreshScreen() {
+	editorScroll();
+
 	struct app_buffer ab = APP_BUFFER_INIT;
 
 	// Uses escape sequences to hide cursor, reset cursor
@@ -270,7 +344,8 @@ void editorRefreshScreen() {
 
 	// Moves cursor on screen
 	char buffer[32];
-	snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+	// Use (E.cy - E.rowoff) for proper cursor behavior upon scrolling
+	snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", (E.cy - E.rowoffset) + 1, E.cx + 1);
 	abAppend(&ab, buffer, strlen(buffer)); 
 
 	// Show cursor
@@ -297,7 +372,7 @@ void editorMoveCursor(int key) {
 				E.cy--;
 			break;
 		case ARROW_DOWN:
-			if (E.cy != E.screenrows -1)
+			if (E.cy < E.numrows)
 				E.cy++;
 			break;
 	}
@@ -345,18 +420,25 @@ void initEditor() {
 	// Cursor position (x,y)
 	E.cx = 0;
 	E.cy = 0;
+	// Row data
+	E.numrows = 0; 
+	E.rowoffset = 0;
+	E.row = NULL;
+
 
 	if (getWindowSize(&E.screenrows, &E.screencols) == -1) 
 		die("getWindowSize");
 }
 
-int main() {
+int main(int argc, char *argv[]) {
 	// Terminal starts in canonical/cooked mode 
 	// (i.e. keyboard input is sent upon Enter press)
 	// This changes it to what is needed, raw mode
 	// (i.e. keyboard input is processed per key input)
 	enableRawMode();
 	initEditor();
+	if (argc >= 2)
+		editorOpen(argv[1]);
 
 	// Read bytes from stdin until Ctrl-q press
 	const int True = 1;
