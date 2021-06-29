@@ -5,10 +5,12 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -20,6 +22,8 @@
 #define APP_BUFFER_INIT {NULL, 0}
 // Text editor version number
 #define VERSION "0.0.1"
+// Length of tabs (max. chars needed)
+#define TAB_STOP 8
 
 // Arrow key constants
 // > 1000 to be out of char range
@@ -40,11 +44,17 @@ enum editorKey {
 typedef struct erow {
 	int size;
 	char *chars;
+	// Render information
+	int rsize;
+	char *render;
 } erow;
 
+// Global state
 struct editorConfig {
 	// Cursor position (x, y)
+	// Render index
 	int cx, cy;
+	int rx;
 	// Holds screen dimensions
 	// orig_termios: original terminal settings
 	int screenrows;
@@ -52,8 +62,13 @@ struct editorConfig {
 	// For row text storing
 	int numrows;
 	erow *row;
-	// Row that user is currently on
+	// Row/col that user is currently on
 	int rowoffset;
+	int coloffset;
+	// Status bar information
+	char *filename;
+	char statusmsg[80];
+	time_t msg_time;
 
 	struct termios orig_termios;
 };
@@ -219,6 +234,42 @@ int getWindowSize(int *rows, int *cols) {
 }
 
 /*** ROW OPERATIONS ***/
+int editorRowCxToRx(erow *row, int cx) {
+	// Converts chars index -> render index
+	int rx = 0; 
+	for (int i = 0; i < cx; i++) {
+		// If tab...
+		if (row->chars[i] == '\t')
+			// Find # cols to left of next tab stop
+			rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+		rx++;
+	}
+	return rx;
+}
+void editorUpdateRow(erow *row) {
+	// Renders each text row, replacing tabs with spaces
+	int tabs = 0;
+	// Count # of tabs for memory allocation
+	for (int j = 0; j < row->size; j++)
+		if (row->chars[j] == '\t') tabs++;
+	
+	free(row->render);
+	row->render = malloc(row->size + tabs * (TAB_STOP - 1) + 1);
+
+	int idx = 0;
+	for (int j = 0; j < row->size; j++) {
+		if (row->chars[j] == '\t') {
+			row->render[idx++] = ' ';
+			// Append spaces until tab stop (col. % 8 == 0)
+			while (idx % TAB_STOP != 0) row->render[idx++] = ' ';
+		}
+		else
+			row->render[idx++] = row->chars[j];
+	}
+	row->render[idx] = '\0';
+	row->rsize = idx;
+}
+
 void editorAppendRow(char *s, size_t len) {
 	// Adds row s of size len to text
 	// Allocate size of erow * number of rows
@@ -229,11 +280,19 @@ void editorAppendRow(char *s, size_t len) {
 	E.row[at].chars = malloc(len + 1);
 	memcpy(E.row[at].chars, s, len);
 	E.row[at].chars[len] = '\0';
+
+	E.row[at].rsize = 0;
+	E.row[at].render = NULL;
+	editorUpdateRow(&E.row[at]);
+
 	E.numrows++;
 }
 
 /*** FILE I/O ***/
 void editorOpen(char *filename) {
+	free(E.filename);
+	E.filename = strdup(filename);
+
 	// Open file
 	FILE *fp = fopen(filename, "r");	
 	if (!fp) die("fopen");
@@ -285,12 +344,22 @@ void abFree(struct app_buffer *ab) {
 
 /*** OUTPUT ***/
 void editorScroll() {
+	E.rx = E.cx;
+	if (E.cy < E.numrows)
+		E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+
 	// If user scrolls up...
 	if (E.cy < E.rowoffset) 
 		E.rowoffset = E.cy;
 	// If user scrolls down...
 	if (E.cy >= E.rowoffset + E.screenrows)
 		E.rowoffset = E.cy - E.screenrows + 1;
+	// If user scrolls left...
+	if (E.rx < E.coloffset)
+		E.coloffset = E.rx;
+	// If user scrolls right...
+	if (E.rx >= E.coloffset + E.screencols)
+		E.coloffset = E.rx - E.screencols + 1;
 }
 
 void editorDrawRows(struct app_buffer *ab) {
@@ -318,17 +387,52 @@ void editorDrawRows(struct app_buffer *ab) {
 		else abAppend(ab, "~", 1);
 		}
 		else {
-			int len = E.row[filerow].size;
+			int len = E.row[filerow].rsize - E.coloffset;
+			if (len < 0) len = 0;
 			if (len > E.screencols) len = E.screencols;
-			abAppend(ab, E.row[filerow].chars, len);
+			abAppend(ab, &E.row[filerow].render[E.coloffset], len);
 		}
 		// Escape sequence to clear lines 
 		abAppend(ab, "\x1b[K", 3);
-
-		// If it isn't the last row...
-		if (i < E.screenrows - 1)
-			abAppend(ab, "\r\n", 2);
+		abAppend(ab, "\r\n", 2);
 	}
+}
+
+void editorDrawStatusBar(struct app_buffer *ab) {
+	abAppend(ab, "\x1b[7m", 4);
+
+	char status[80];
+	char rstatus[80];
+
+	// Displays filename, up to 20 chars
+	int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+		E.filename ? E.filename : "[No Name]", E.numrows);
+	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
+		E.cy + 1, E.numrows);
+
+	if (len > E.screencols) len = E.screencols;
+	abAppend(ab, status, len);
+
+	while (len < E.screencols) {
+		if (E.screencols - len == rlen) {
+			abAppend(ab, rstatus, rlen);
+			break;
+		}
+		else {
+			abAppend(ab, " ", 1);
+			len++;
+		}
+	}
+	abAppend(ab, "\x1b[m", 3);
+	abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMsgBar(struct app_buffer *ab) {
+	abAppend(ab, "\x1b[K", 3);
+	int length = strlen(E.statusmsg);
+	if (length > E.screencols) length = E.screencols;
+	if (length && time(NULL) - E.msg_time < 5) 
+		abAppend(ab, E.statusmsg, length);
 }
 
 void editorRefreshScreen() {
@@ -341,11 +445,14 @@ void editorRefreshScreen() {
 	abAppend(&ab, "\x1b[H", 3);
 
 	editorDrawRows(&ab);
+	editorDrawStatusBar(&ab);
+	editorDrawMsgBar(&ab);
 
 	// Moves cursor on screen
 	char buffer[32];
-	// Use (E.cy - E.rowoff) for proper cursor behavior upon scrolling
-	snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", (E.cy - E.rowoffset) + 1, E.cx + 1);
+	// Use (E.cy - E.rowoffset) for proper cursor behavior upon scrolling
+	// Use (E.cx - E.coloffset) for proper cursor behavior upon scrolling
+	snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", (E.cy - E.rowoffset) + 1, (E.rx - E.coloffset) + 1);
 	abAppend(&ab, buffer, strlen(buffer)); 
 
 	// Show cursor
@@ -355,17 +462,39 @@ void editorRefreshScreen() {
 	abFree(&ab);
 }
 
+void editorSetStatusMsg(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+
+	vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+	va_end(ap);
+
+	E.msg_time = time(NULL);
+}
+
 /*** INPUT ***/
 // Adds arrow key cursor movement
 void editorMoveCursor(int key) {
+	// So cursor doesn't go past current line...
+	erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
 	switch (key) {
 		case ARROW_LEFT:
+			// Makes sure user goes from beginning of line to end of previous line upon backspaces
 			if (E.cx != 0) 
 				E.cx--;
+			else if (E.cy > 0) {
+				E.cy--;
+				E.cx = E.row[E.cy].size; 
+			}
 			break;
 		case ARROW_RIGHT:
-			if (E.cx != E.screencols - 1)
+			if (row && E.cx < row->size) 
 				E.cx++;
+			else if (row && E.cx == row->size) {
+				E.cy++;
+				E.cx = 0;
+			}
 			break;
 		case ARROW_UP:
 			if (E.cy != 0)
@@ -376,6 +505,12 @@ void editorMoveCursor(int key) {
 				E.cy++;
 			break;
 	}
+	
+	// Makes sure cursor stays on end of line
+	row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+	int rowlen = row ? row->size : 0;
+	if (E.cx > rowlen)
+		E.cx = rowlen;
 }
 
 // Takes keypress, then handles it based on switch case 
@@ -392,6 +527,12 @@ void editorProcessKeypress() {
 		case PAGE_UP:
 		case PAGE_DOWN:
 			{
+				if (c == PAGE_UP)
+					E.cy = E.rowoffset;
+				else if (c == PAGE_DOWN) { 
+					E.cy = E.rowoffset + E.screenrows - 1;
+					if (E.cy > E.numrows) E.cy = E.numrows;
+				}
 				int times = E.screenrows;
 				while (times--)
 					editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -403,7 +544,8 @@ void editorProcessKeypress() {
 			break;
 
 		case END_KEY:
-			E.cx = E.screencols - 1;
+			if (E.cy < E.numrows)
+				E.cx = E.row[E.cy].size;
 			break;
 
 		case ARROW_UP:
@@ -420,14 +562,24 @@ void initEditor() {
 	// Cursor position (x,y)
 	E.cx = 0;
 	E.cy = 0;
+	E.rx = 0;
+
 	// Row data
 	E.numrows = 0; 
 	E.rowoffset = 0;
+	E.coloffset = 0;
 	E.row = NULL;
 
+	// File information
+	E.filename = NULL;
+	E.statusmsg[0] = '\0';
+	E.msg_time = 0;
 
 	if (getWindowSize(&E.screenrows, &E.screencols) == -1) 
 		die("getWindowSize");
+	
+	// So editorDrawRows() doesn't draw text @ bottom of screen
+	E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[]) {
@@ -439,6 +591,8 @@ int main(int argc, char *argv[]) {
 	initEditor();
 	if (argc >= 2)
 		editorOpen(argv[1]);
+
+	editorSetStatusMsg("HELP: Ctrl-Q to quit");
 
 	// Read bytes from stdin until Ctrl-q press
 	const int True = 1;
