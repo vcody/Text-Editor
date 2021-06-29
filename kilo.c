@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <time.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 
@@ -28,6 +29,7 @@
 // Arrow key constants
 // > 1000 to be out of char range
 enum editorKey {
+	BACKSPACE = 127,
 	ARROW_LEFT = 1000,
 	ARROW_RIGHT,
 	ARROW_UP,
@@ -288,7 +290,51 @@ void editorAppendRow(char *s, size_t len) {
 	E.numrows++;
 }
 
+void editorRowInsertChar(erow *row, int at, int c) {
+	// If index less than 0 or bigger than row size...
+	if (at < 0 || at > row->size) at = row->size;
+
+	// Put char at index
+	row->chars = realloc(row->chars, row->size + 2);
+	memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+	row->size++;
+	row->chars[at] = c;
+	
+	editorUpdateRow(row);
+}
+
+/*** EDITOR OPERATIONS ***/
+void editorInsertChar(int c) {
+	// If end of line, make new line
+	if (E.cy == E.numrows)
+		editorAppendRow("", 0);
+	// Insert character
+	editorRowInsertChar(&E.row[E.cy], E.cx, c);
+	E.cx++;
+}
+
 /*** FILE I/O ***/
+char *editorRowsToString(int *buffer_len) {
+	// Take lines from buffer and convert into one string
+	int total_len = 0;
+	// Get length of each row, adding 1 for newline
+	for (int i = 0; i < E.numrows; i++)
+		total_len += E.row[i].size + 1;
+	*buffer_len = total_len;
+
+	char *buffer = malloc(total_len);
+	char *p = buffer;
+
+	for (int i = 0; i < E.numrows; i++) {
+		memcpy(p, E.row[i].chars, E.row[i].size);
+		p += E.row[i].size;
+		*p = '\n';
+		p++;
+	}
+
+	return buffer;
+}
+
 void editorOpen(char *filename) {
 	free(E.filename);
 	E.filename = strdup(filename);
@@ -313,6 +359,22 @@ void editorOpen(char *filename) {
 	// Close pointer/file
 	free(line);
 	fclose(fp);
+}
+
+void editorSave() {
+	if (E.filename == NULL) return;
+
+	int len;
+	char *buffer = editorRowsToString(&len);
+	
+	// Open file w/ read/write permissions, set file size length, write to file
+	int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+	ftruncate(fd, len);
+	write(fd, buffer, len);
+
+	close(fd);
+	free(buffer);
+
 }
 
 /*** APPEND BUFFER ***/
@@ -518,10 +580,17 @@ void editorProcessKeypress() {
 	int c = editorReadKey();
 
 	switch (c) {
+		case '\r':
+			break;
+
 		case CTRL_KEY('q'):
 			write(STDOUT_FILENO, "\x1b[2J", 4);
 			write(STDOUT_FILENO, "\x1b[H", 3);
 			exit(0);
+			break;
+
+		case CTRL_KEY('s'):
+			editorSave();
 			break;
 
 		case PAGE_UP:
@@ -548,11 +617,24 @@ void editorProcessKeypress() {
 				E.cx = E.row[E.cy].size;
 			break;
 
+		case BACKSPACE:
+		case CTRL_KEY('h'):
+		case DEL_KEY:
+			break;
+		
+		case CTRL_KEY('l'):
+		case '\x1b':
+			break;
+
 		case ARROW_UP:
 		case ARROW_DOWN:
 		case ARROW_LEFT:
 		case ARROW_RIGHT:
 			editorMoveCursor(c);
+			break;
+
+		default:
+			editorInsertChar(c);
 			break;
 	}
 }
